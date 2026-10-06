@@ -1,6 +1,7 @@
 package com.example.bosondiag
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -21,6 +22,7 @@ import android.view.SurfaceView
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -28,14 +30,15 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import java.util.Locale
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 /**
- * Live Y16 preview. The USB thread only copies frames into a hand-off buffer;
- * a separate render thread tone-maps and draws the newest one, so slow drawing
- * can never stall USB reads.
+ * Live Y16 preview + MP4 recording + FSLP serial commands.
+ * Threads: USB reader (copies frames only) -> render thread (display) and record thread (encoder),
+ * each with its own tone mapper so neither can stall USB reads or each other.
  */
 class LiveActivity : Activity(), SurfaceHolder.Callback {
 
@@ -45,6 +48,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var toggleBtn: Button
     private lateinit var fpsBtn: Button
     private lateinit var polBtn: Button
+    private lateinit var recBtn: Button
 
     private var streamer: UvcBulkStreamer? = null
     private var statsSource: UvcBulkStreamer? = null
@@ -54,24 +58,32 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     private val surfaceLock = Any()
     private var surfaceReady = false
 
-    // Frame hand-off between USB thread and render thread.
+    // Frame hand-off from USB thread.
     private val frameLock = ReentrantLock()
     private val frameCond = frameLock.newCondition()
     private val latest = ByteArray(W * H * 2)
     private var seq = 0L
+
+    // Display.
     private var renderThread: Thread? = null
     @Volatile private var renderRunning = false
     @Volatile private var renderedFrames = 0L
     @Volatile private var pendingSnap = false
-
     private val bmp: Bitmap = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
     private val pixels = IntArray(W * H)
-    private val vals = IntArray(W * H)
-    private val hist = IntArray(16384)
+    private val mapper = ToneMapper(W, H)
     private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-    private var haveRange = false
-    @Volatile private var lo = 0f
-    @Volatile private var hi = 0f
+
+    // Recording.
+    private var recThread: Thread? = null
+    @Volatile private var recRunning = false
+    @Volatile private var recorder: Mp4Recorder? = null
+    @Volatile private var recFrames = 0L
+    private var recStartMs = 0L
+
+    // Serial.
+    private val serialExec = Executors.newSingleThreadExecutor()
+    private var serial: BosonSerial? = null
 
     private val logLines = ArrayList<String>()
     private val ui = Handler(Looper.getMainLooper())
@@ -84,6 +96,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         override fun onReceive(context: Context, intent: Intent) {
             log("USB device detached")
             stopStream()
+            closeSerial()
             updateButtons()
         }
     }
@@ -93,7 +106,13 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
             val s = streamer
             if (s != null && !s.isAlive) {
                 streamer = null
+                stopRecording()
                 stopRender()
+                updateButtons()
+            }
+            val rt = recThread
+            if (rt != null && !rt.isAlive) {
+                recThread = null
                 updateButtons()
             }
             updateStats()
@@ -123,7 +142,13 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         super.onStop()
         ui.removeCallbacks(ticker)
         stopStream()
+        closeSerial()
         unregisterReceiver(detachReceiver)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        serialExec.shutdown()
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
@@ -170,18 +195,36 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
                 pendingSnap = true
             }
         }
+        recBtn = btn("Rec") {
+            if (recThread == null) startRecording() else stopRecording()
+            updateButtons()
+        }
+        val ffcBtn = btn("FFC") {
+            runCommand("FFC", BosonSerial.FN_RUN_FFC, ByteArray(0))
+        }
+        val snBtn = btn("Serial #") {
+            runCommand("Get serial number", BosonSerial.FN_GET_CAMERA_SN, ByteArray(0))
+        }
+        val consoleBtn = btn("Console") { showConsole() }
 
-        val row = LinearLayout(act)
-        row.addView(toggleBtn)
-        row.addView(fpsBtn)
-        row.addView(polBtn)
-        row.addView(snapBtn)
+        val row1 = LinearLayout(act)
+        row1.addView(toggleBtn)
+        row1.addView(fpsBtn)
+        row1.addView(polBtn)
+        row1.addView(snapBtn)
+
+        val row2 = LinearLayout(act)
+        row2.addView(recBtn)
+        row2.addView(ffcBtn)
+        row2.addView(snBtn)
+        row2.addView(consoleBtn)
 
         val root = LinearLayout(act)
         root.orientation = LinearLayout.VERTICAL
         root.addView(surface, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         root.addView(statsView)
-        root.addView(row)
+        root.addView(row1)
+        root.addView(row2)
         setContentView(root)
 
         ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
@@ -198,6 +241,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         toggleBtn.text = if (streamer == null) "Start" else "Stop"
         fpsBtn.text = if (fps60) "Rate: 60" else "Rate: 30"
         polBtn.text = if (invert) "Black-hot" else "White-hot"
+        recBtn.text = if (recThread == null) "Rec" else "Stop rec"
     }
 
     private fun log(msg: String) {
@@ -217,6 +261,8 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         return null
     }
 
+    // ---------------------------------------------------------------- streaming
+
     private fun startStream() {
         if (streamer != null) return
         val dev = findDevice()
@@ -228,7 +274,8 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
             log("No USB permission. Go back and tap 'Grant USB permission'.")
             return
         }
-        haveRange = false
+        mapper.reset()
+        frameLock.withLock { seq = 0L }
         prevT = 0L
         prevOk = 0L
         prevBytes = 0L
@@ -250,6 +297,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun stopStream() {
+        stopRecording()
         val s = streamer
         if (s != null) {
             s.running = false
@@ -259,7 +307,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         stopRender()
     }
 
-    // Runs on the USB thread: copy only, never draw.
+    // USB thread: copy only.
     private fun offerFrame(f: ByteArray) {
         frameLock.withLock {
             System.arraycopy(f, 0, latest, 0, latest.size)
@@ -268,6 +316,26 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    /** Blocks until a frame newer than [lastSeq] exists; copies it to [dst]. Returns its seq, or -1 if no longer alive. */
+    private fun awaitFrame(lastSeq: Long, dst: ByteArray, alive: () -> Boolean): Long {
+        var result = -1L
+        frameLock.withLock {
+            while (alive() && seq == lastSeq) {
+                try {
+                    frameCond.await(200, TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                }
+            }
+            if (alive()) {
+                System.arraycopy(latest, 0, dst, 0, dst.size)
+                result = seq
+            }
+        }
+        return result
+    }
+
+    // ---------------------------------------------------------------- display
+
     private fun startRender() {
         if (renderThread != null) return
         renderRunning = true
@@ -275,22 +343,12 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
             val local = ByteArray(W * H * 2)
             var lastSeq = 0L
             while (renderRunning) {
-                var got = false
-                frameLock.withLock {
-                    while (renderRunning && seq == lastSeq) {
-                        try {
-                            frameCond.await(200, TimeUnit.MILLISECONDS)
-                        } catch (_: InterruptedException) {
-                        }
-                    }
-                    if (renderRunning) {
-                        System.arraycopy(latest, 0, local, 0, local.size)
-                        lastSeq = seq
-                        got = true
-                    }
-                }
-                if (!got) continue
-                processFrame(local)
+                val s = awaitFrame(lastSeq, local) { renderRunning }
+                if (s < 0) continue
+                lastSeq = s
+                mapper.map(local, invert, pixels)
+                bmp.setPixels(pixels, 0, W, 0, 0, W, H)
+                drawBitmap()
                 renderedFrames++
                 if (pendingSnap) {
                     pendingSnap = false
@@ -309,75 +367,6 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         frameLock.withLock { frameCond.signalAll() }
         try { t.join(2000) } catch (_: InterruptedException) {}
         renderThread = null
-    }
-
-    private fun doSnapshot(raw: ByteArray) {
-        val rawCopy = raw.copyOf()
-        val bmpCopy = bmp.copy(Bitmap.Config.ARGB_8888, false) ?: return
-        val appCtx = applicationContext
-        Thread {
-            try {
-                val name = Capture.saveSnapshot(appCtx, rawCopy, W, H, bmpCopy)
-                log("saved Pictures/BosonThermal/$name (.png + _raw16.tif)")
-                runOnUiThread {
-                    Toast.makeText(this, "Saved $name", Toast.LENGTH_SHORT).show()
-                }
-            } catch (e: Exception) {
-                log("snapshot failed: $e")
-            }
-        }.start()
-    }
-
-    // Runs on the render thread.
-    private fun processFrame(f: ByteArray) {
-        java.util.Arrays.fill(hist, 0)
-        var j = 0
-        val total = W * H
-        for (p in 0 until total) {
-            val v = (f[j].toInt() and 0xFF) or ((f[j + 1].toInt() and 0xFF) shl 8)
-            j += 2
-            vals[p] = v
-            hist[v shr 2]++
-        }
-        val lowTarget = total / 100
-        val highTarget = total - total / 100
-        var acc = 0
-        var loBin = 0
-        var hiBin = hist.size - 1
-        var gotLo = false
-        for (b in hist.indices) {
-            acc += hist[b]
-            if (!gotLo && acc >= lowTarget) {
-                loBin = b
-                gotLo = true
-            }
-            if (acc >= highTarget) {
-                hiBin = b
-                break
-            }
-        }
-        val loV = loBin * 4f
-        val hiV = hiBin * 4f + 3f
-        if (!haveRange) {
-            lo = loV
-            hi = hiV
-            haveRange = true
-        } else {
-            lo += (loV - lo) * 0.1f
-            hi += (hiV - hi) * 0.1f
-        }
-        val range = maxOf(hi - lo, 64f)
-        val scale = 255f / range
-        val inv = invert
-        val l = lo
-        for (p in 0 until total) {
-            var g = ((vals[p] - l) * scale).toInt()
-            if (g < 0) g = 0 else if (g > 255) g = 255
-            if (inv) g = 255 - g
-            pixels[p] = (0xFF shl 24) or (g shl 16) or (g shl 8) or g
-        }
-        bmp.setPixels(pixels, 0, W, 0, 0, W, H)
-        drawBitmap()
     }
 
     private fun drawBitmap() {
@@ -400,6 +389,157 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
             }
         }
     }
+
+    private fun doSnapshot(raw: ByteArray) {
+        val rawCopy = raw.copyOf()
+        val bmpCopy = bmp.copy(Bitmap.Config.ARGB_8888, false) ?: return
+        val appCtx = applicationContext
+        Thread {
+            try {
+                val name = Capture.saveSnapshot(appCtx, rawCopy, W, H, bmpCopy)
+                log("saved Pictures/BosonThermal/$name (.png + _raw16.tif)")
+                runOnUiThread {
+                    Toast.makeText(this, "Saved $name", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                log("snapshot failed: $e")
+            }
+        }.start()
+    }
+
+    // ---------------------------------------------------------------- recording
+
+    private fun startRecording() {
+        if (recThread != null) return
+        if (streamer == null) {
+            Toast.makeText(this, "Start streaming first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val rec = Mp4Recorder(applicationContext, 640, 512, if (fps60) 60 else 30)
+        try {
+            rec.start()
+        } catch (e: Exception) {
+            log("record start failed: $e")
+            rec.abort()
+            return
+        }
+        recorder = rec
+        recFrames = 0L
+        recStartMs = SystemClock.elapsedRealtime()
+        recRunning = true
+        log("recording -> Movies/BosonThermal/${rec.name}")
+        val t = Thread {
+            val local = ByteArray(W * H * 2)
+            val px = IntArray(W * H)
+            val rb = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
+            val recMapper = ToneMapper(W, H)
+            var lastSeq = 0L
+            try {
+                while (recRunning) {
+                    val s = awaitFrame(lastSeq, local) { recRunning }
+                    if (s < 0) continue
+                    lastSeq = s
+                    recMapper.map(local, invert, px)
+                    rb.setPixels(px, 0, W, 0, 0, W, H)
+                    rec.addFrame(rb)
+                    recFrames++
+                }
+            } catch (e: Exception) {
+                log("recording error: $e")
+            }
+            val kept = rec.finish()
+            log(
+                if (kept) "recording saved: ${rec.name} (${rec.framesWritten} frames, " +
+                    String.format(Locale.US, "%.1f MB)", rec.bytesWritten / 1e6)
+                else "recording discarded (no frames written)"
+            )
+            recorder = null
+        }
+        t.name = "record"
+        recThread = t
+        t.start()
+    }
+
+    private fun stopRecording() {
+        val t = recThread ?: return
+        recRunning = false
+        frameLock.withLock { frameCond.signalAll() }
+        try { t.join(8000) } catch (_: InterruptedException) {}
+        recThread = null
+    }
+
+    // ---------------------------------------------------------------- serial (FSLP)
+
+    private fun runCommand(label: String, fn: Int, data: ByteArray) {
+        val dev = findDevice()
+        if (dev == null) {
+            log("No device attached")
+            return
+        }
+        if (!usb.hasPermission(dev)) {
+            log("No USB permission")
+            return
+        }
+        var s = serial
+        if (s == null) {
+            s = BosonSerial(usb, dev)
+            serial = s
+        }
+        val ser = s
+        serialExec.execute {
+            val r = ser.transact(fn, data)
+            log("$label: " + BosonSerial.describe(r))
+        }
+    }
+
+    private fun closeSerial() {
+        val s = serial ?: return
+        serial = null
+        try {
+            serialExec.execute { s.close() }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun parseHexBytes(text: String): ByteArray {
+        val tokens = text.trim().split(Regex("[\\s,]+")).filter { it.isNotEmpty() }
+        val out = ByteArray(tokens.size)
+        for ((i, tk) in tokens.withIndex()) {
+            val t = tk.removePrefix("0x").removePrefix("0X").removePrefix("x").removePrefix("X")
+            out[i] = t.toInt(16).toByte()
+        }
+        return out
+    }
+
+    private fun showConsole() {
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(16), dp(8), dp(16), dp(0))
+        val fn = EditText(this)
+        fn.hint = "Function ID (hex), e.g. 00050007"
+        fn.setSingleLine()
+        val data = EditText(this)
+        data.hint = "Data bytes (hex, optional), e.g. 00 00 00 01"
+        data.setSingleLine()
+        box.addView(fn)
+        box.addView(data)
+        AlertDialog.Builder(this)
+            .setTitle("Send FSLP command")
+            .setView(box)
+            .setPositiveButton("Send") { _, _ ->
+                try {
+                    val id = fn.text.toString().trim().removePrefix("0x").removePrefix("0X").toLong(16).toInt()
+                    val bytes = parseHexBytes(data.text.toString())
+                    runCommand(String.format(Locale.US, "cmd 0x%08X", id), id, bytes)
+                } catch (e: Exception) {
+                    log("bad console input: $e")
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // ---------------------------------------------------------------- stats
 
     private fun updateStats() {
         val s = statsSource
@@ -431,7 +571,17 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
             sb.appendLine(
                 "frames ok=$ok bad=${s.framesBad}  bad hdrs=${s.badHeaders}  read errs=${s.readErrors}"
             )
-            sb.appendLine(String.format(Locale.US, "tone range lo=%.0f hi=%.0f", lo, hi))
+            sb.appendLine(String.format(Locale.US, "tone range lo=%.0f hi=%.0f", mapper.lo, mapper.hi))
+        }
+        val rec = recorder
+        if (recThread != null && rec != null) {
+            val secs = (SystemClock.elapsedRealtime() - recStartMs) / 1000
+            sb.appendLine(
+                String.format(
+                    Locale.US, "REC %02d:%02d  fed=%d  encoded=%d  %.1f MB",
+                    secs / 60, secs % 60, recFrames, rec.framesWritten, rec.bytesWritten / 1e6
+                )
+            )
         }
         sb.appendLine("--- log ---")
         synchronized(logLines) {
