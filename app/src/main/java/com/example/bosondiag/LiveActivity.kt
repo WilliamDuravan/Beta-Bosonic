@@ -23,12 +23,20 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import java.util.Locale
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
-/** Level 1: live Y16 preview straight from the Boson over UVC bulk. */
+/**
+ * Live Y16 preview. The USB thread only copies frames into a hand-off buffer;
+ * a separate render thread tone-maps and draws the newest one, so slow drawing
+ * can never stall USB reads.
+ */
 class LiveActivity : Activity(), SurfaceHolder.Callback {
 
     private lateinit var usb: UsbManager
@@ -46,6 +54,16 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     private val surfaceLock = Any()
     private var surfaceReady = false
 
+    // Frame hand-off between USB thread and render thread.
+    private val frameLock = ReentrantLock()
+    private val frameCond = frameLock.newCondition()
+    private val latest = ByteArray(W * H * 2)
+    private var seq = 0L
+    private var renderThread: Thread? = null
+    @Volatile private var renderRunning = false
+    @Volatile private var renderedFrames = 0L
+    @Volatile private var pendingSnap = false
+
     private val bmp: Bitmap = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
     private val pixels = IntArray(W * H)
     private val vals = IntArray(W * H)
@@ -60,6 +78,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     private var prevT = 0L
     private var prevOk = 0L
     private var prevBytes = 0L
+    private var prevRendered = 0L
 
     private val detachReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -74,6 +93,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
             val s = streamer
             if (s != null && !s.isAlive) {
                 streamer = null
+                stopRender()
                 updateButtons()
             }
             updateStats()
@@ -143,11 +163,19 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
             invert = !invert
             updateButtons()
         }
+        val snapBtn = btn("Snap") {
+            if (streamer == null) {
+                Toast.makeText(act, "Start streaming first", Toast.LENGTH_SHORT).show()
+            } else {
+                pendingSnap = true
+            }
+        }
 
         val row = LinearLayout(act)
         row.addView(toggleBtn)
         row.addView(fpsBtn)
         row.addView(polBtn)
+        row.addView(snapBtn)
 
         val root = LinearLayout(act)
         root.orientation = LinearLayout.VERTICAL
@@ -204,28 +232,103 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         prevT = 0L
         prevOk = 0L
         prevBytes = 0L
+        prevRendered = 0L
+        renderedFrames = 0L
         log("starting Y16 320x256 @ " + (if (fps60) 60 else 30) + " fps")
         val s = UvcBulkStreamer(
             usb, dev,
             2, 1,
             if (fps60) 166666 else 333333,
             W * H * 2,
-            { processFrame(it) },
+            { offerFrame(it) },
             { log(it) }
         )
         streamer = s
         statsSource = s
+        startRender()
         s.start()
     }
 
     private fun stopStream() {
-        val s = streamer ?: return
-        s.running = false
-        try { s.join(2500) } catch (_: InterruptedException) {}
-        streamer = null
+        val s = streamer
+        if (s != null) {
+            s.running = false
+            try { s.join(2500) } catch (_: InterruptedException) {}
+            streamer = null
+        }
+        stopRender()
     }
 
-    // Runs on the streamer thread.
+    // Runs on the USB thread: copy only, never draw.
+    private fun offerFrame(f: ByteArray) {
+        frameLock.withLock {
+            System.arraycopy(f, 0, latest, 0, latest.size)
+            seq++
+            frameCond.signalAll()
+        }
+    }
+
+    private fun startRender() {
+        if (renderThread != null) return
+        renderRunning = true
+        val t = Thread {
+            val local = ByteArray(W * H * 2)
+            var lastSeq = 0L
+            while (renderRunning) {
+                var got = false
+                frameLock.withLock {
+                    while (renderRunning && seq == lastSeq) {
+                        try {
+                            frameCond.await(200, TimeUnit.MILLISECONDS)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                    if (renderRunning) {
+                        System.arraycopy(latest, 0, local, 0, local.size)
+                        lastSeq = seq
+                        got = true
+                    }
+                }
+                if (!got) continue
+                processFrame(local)
+                renderedFrames++
+                if (pendingSnap) {
+                    pendingSnap = false
+                    doSnapshot(local)
+                }
+            }
+        }
+        t.name = "render"
+        renderThread = t
+        t.start()
+    }
+
+    private fun stopRender() {
+        val t = renderThread ?: return
+        renderRunning = false
+        frameLock.withLock { frameCond.signalAll() }
+        try { t.join(2000) } catch (_: InterruptedException) {}
+        renderThread = null
+    }
+
+    private fun doSnapshot(raw: ByteArray) {
+        val rawCopy = raw.copyOf()
+        val bmpCopy = bmp.copy(Bitmap.Config.ARGB_8888, false) ?: return
+        val appCtx = applicationContext
+        Thread {
+            try {
+                val name = Capture.saveSnapshot(appCtx, rawCopy, W, H, bmpCopy)
+                log("saved Pictures/BosonThermal/$name (.png + _raw16.tif)")
+                runOnUiThread {
+                    Toast.makeText(this, "Saved $name", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                log("snapshot failed: $e")
+            }
+        }.start()
+    }
+
+    // Runs on the render thread.
     private fun processFrame(f: ByteArray) {
         java.util.Arrays.fill(hist, 0)
         var j = 0
@@ -307,19 +410,23 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
             val now = SystemClock.elapsedRealtime()
             val ok = s.framesOk
             val bytes = s.bytesTotal
+            val rendered = renderedFrames
             var fps = 0.0
             var mbs = 0.0
+            var dfps = 0.0
             if (prevT != 0L && now > prevT) {
                 val dt = (now - prevT) / 1000.0
                 fps = (ok - prevOk) / dt
                 mbs = (bytes - prevBytes) / dt / 1e6
+                dfps = (rendered - prevRendered) / dt
             }
             prevT = now
             prevOk = ok
             prevBytes = bytes
+            prevRendered = rendered
             sb.appendLine(
                 "state: " + (if (s.streaming) "STREAMING" else "stopped") +
-                    String.format(Locale.US, "   %.1f fps   %.2f MB/s", fps, mbs)
+                    String.format(Locale.US, "   USB %.1f fps   %.2f MB/s   display %.1f fps", fps, mbs, dfps)
             )
             sb.appendLine(
                 "frames ok=$ok bad=${s.framesBad}  bad hdrs=${s.badHeaders}  read errs=${s.readErrors}"
