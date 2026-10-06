@@ -47,13 +47,21 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var statsView: TextView
     private lateinit var toggleBtn: Button
     private lateinit var fpsBtn: Button
-    private lateinit var polBtn: Button
+    private lateinit var palBtn: Button
+    private lateinit var minBtn: Button
+    private lateinit var fpnBtn: Button
     private lateinit var recBtn: Button
 
     private var streamer: UvcBulkStreamer? = null
     private var statsSource: UvcBulkStreamer? = null
     private var fps60 = true
-    @Volatile private var invert = false
+    @Volatile private var paletteIdx = 0
+    @Volatile private var minRange = 64f
+    @Volatile private var fpnEnabled = true
+    @Volatile private var fpnOffset: IntArray? = null
+    @Volatile private var calSum: IntArray? = null
+    @Volatile private var calRemaining = 0
+    private val minRangeChoices = floatArrayOf(64f, 150f, 300f, 600f)
 
     private val surfaceLock = Any()
     private var surfaceReady = false
@@ -184,8 +192,8 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
             }
             updateButtons()
         }
-        polBtn = btn("White-hot") {
-            invert = !invert
+        palBtn = btn("White-hot") {
+            paletteIdx = (paletteIdx + 1) % Palettes.names.size
             updateButtons()
         }
         val snapBtn = btn("Snap") {
@@ -200,17 +208,38 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
             updateButtons()
         }
         val ffcBtn = btn("FFC") {
-            runCommand("FFC", BosonSerial.FN_RUN_FFC, ByteArray(0))
+            runCommand("FFC", BosonSerial.FN_RUN_FFC, ByteArray(0)) {
+                if (fpnOffset != null) {
+                    fpnOffset = null
+                    log("FFC changed the camera's offsets: software FPN correction cleared, recalibrate")
+                    runOnUiThread { updateButtons() }
+                }
+            }
         }
         val snBtn = btn("Serial #") {
             runCommand("Get serial number", BosonSerial.FN_GET_CAMERA_SN, ByteArray(0))
         }
         val consoleBtn = btn("Console") { showConsole() }
 
+        val calBtn = btn("Cal FPN") { startCalibration() }
+        fpnBtn = btn("FPN: none") {
+            if (fpnOffset == null) {
+                Toast.makeText(act, "Run Cal FPN first", Toast.LENGTH_SHORT).show()
+            } else {
+                fpnEnabled = !fpnEnabled
+            }
+            updateButtons()
+        }
+        minBtn = btn("Min range: 64") {
+            val i = minRangeChoices.indexOf(minRange)
+            minRange = minRangeChoices[(i + 1) % minRangeChoices.size]
+            updateButtons()
+        }
+
         val row1 = LinearLayout(act)
         row1.addView(toggleBtn)
         row1.addView(fpsBtn)
-        row1.addView(polBtn)
+        row1.addView(palBtn)
         row1.addView(snapBtn)
 
         val row2 = LinearLayout(act)
@@ -225,6 +254,11 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         root.addView(statsView)
         root.addView(row1)
         root.addView(row2)
+        val row3 = LinearLayout(act)
+        row3.addView(calBtn)
+        row3.addView(fpnBtn)
+        row3.addView(minBtn)
+        root.addView(row3)
         setContentView(root)
 
         ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
@@ -240,7 +274,9 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     private fun updateButtons() {
         toggleBtn.text = if (streamer == null) "Start" else "Stop"
         fpsBtn.text = if (fps60) "Rate: 60" else "Rate: 30"
-        polBtn.text = if (invert) "Black-hot" else "White-hot"
+        palBtn.text = Palettes.names[paletteIdx]
+        minBtn.text = "Min range: " + minRange.toInt()
+        fpnBtn.text = "FPN: " + (if (fpnOffset == null) "none" else if (fpnEnabled) "on" else "off")
         recBtn.text = if (recThread == null) "Rec" else "Stop rec"
     }
 
@@ -309,6 +345,16 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
 
     // USB thread: copy only.
     private fun offerFrame(f: ByteArray) {
+        val sum = calSum
+        if (sum != null && calRemaining > 0) {
+            var j = 0
+            for (p in 0 until W * H) {
+                sum[p] += (f[j].toInt() and 0xFF) or ((f[j + 1].toInt() and 0xFF) shl 8)
+                j += 2
+            }
+            calRemaining -= 1
+            if (calRemaining == 0) finishCalibration(sum)
+        }
         frameLock.withLock {
             System.arraycopy(f, 0, latest, 0, latest.size)
             seq++
@@ -346,7 +392,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
                 val s = awaitFrame(lastSeq, local) { renderRunning }
                 if (s < 0) continue
                 lastSeq = s
-                mapper.map(local, invert, pixels)
+                mapper.map(local, Palettes.luts[paletteIdx], if (fpnEnabled) fpnOffset else null, minRange, pixels)
                 bmp.setPixels(pixels, 0, W, 0, 0, W, H)
                 drawBitmap()
                 renderedFrames++
@@ -439,7 +485,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
                     val s = awaitFrame(lastSeq, local) { recRunning }
                     if (s < 0) continue
                     lastSeq = s
-                    recMapper.map(local, invert, px)
+                    recMapper.map(local, Palettes.luts[paletteIdx], if (fpnEnabled) fpnOffset else null, minRange, px)
                     rb.setPixels(px, 0, W, 0, 0, W, H)
                     rec.addFrame(rb)
                     recFrames++
@@ -468,9 +514,63 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         recThread = null
     }
 
+    // ---------------------------------------------------------------- FPN calibration
+
+    private fun startCalibration() {
+        if (streamer == null) {
+            Toast.makeText(this, "Start streaming first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Calibrate fixed-pattern noise")
+            .setMessage(
+                "1. Optional: run FFC first and let it finish.\n" +
+                    "2. Cover the lens completely with a uniform surface (lens cap, or cardboard pressed against the lens).\n" +
+                    "3. Hold still and tap Start. It averages $CAL_FRAMES frames (about 1 second).\n\n" +
+                    "Recalibrate after any FFC (manual or automatic) or whenever the pattern comes back."
+            )
+            .setPositiveButton("Start") { _, _ ->
+                calSum = IntArray(W * H)
+                calRemaining = CAL_FRAMES
+                log("FPN calibration: averaging $CAL_FRAMES frames...")
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // Runs on the USB thread.
+    private fun finishCalibration(sum: IntArray) {
+        val n = CAL_FRAMES
+        var tot = 0L
+        for (v in sum) tot += v
+        val mean = tot.toDouble() / (n.toDouble() * sum.size)
+        val off = IntArray(sum.size)
+        var mn = Int.MAX_VALUE
+        var mx = Int.MIN_VALUE
+        var sq = 0.0
+        for (p in sum.indices) {
+            val d = Math.round(sum[p].toDouble() / n - mean).toInt()
+            off[p] = d
+            if (d < mn) mn = d
+            if (d > mx) mx = d
+            sq += d.toDouble() * d
+        }
+        val rms = Math.sqrt(sq / sum.size)
+        fpnOffset = off
+        fpnEnabled = true
+        calSum = null
+        log(
+            String.format(
+                Locale.US, "FPN cal done: offsets %d..%d counts, rms %.1f, mean level %.0f", mn, mx, rms, mean
+            )
+        )
+        if (rms > 150.0) log("WARNING: large offsets, lens probably not fully covered or target not uniform")
+        runOnUiThread { updateButtons() }
+    }
+
     // ---------------------------------------------------------------- serial (FSLP)
 
-    private fun runCommand(label: String, fn: Int, data: ByteArray) {
+    private fun runCommand(label: String, fn: Int, data: ByteArray, onOk: (() -> Unit)? = null) {
         val dev = findDevice()
         if (dev == null) {
             log("No device attached")
@@ -489,6 +589,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         serialExec.execute {
             val r = ser.transact(fn, data)
             log("$label: " + BosonSerial.describe(r))
+            if (r.ok && onOk != null) onOk()
         }
     }
 
@@ -572,6 +673,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
                 "frames ok=$ok bad=${s.framesBad}  bad hdrs=${s.badHeaders}  read errs=${s.readErrors}"
             )
             sb.appendLine(String.format(Locale.US, "tone range lo=%.0f hi=%.0f", mapper.lo, mapper.hi))
+            if (calRemaining > 0) sb.appendLine("calibrating... $calRemaining frames left")
         }
         val rec = recorder
         if (recThread != null && rec != null) {
@@ -603,5 +705,6 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     companion object {
         private const val W = 320
         private const val H = 256
+        private const val CAL_FRAMES = 64
     }
 }

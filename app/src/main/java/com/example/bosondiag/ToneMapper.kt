@@ -1,6 +1,10 @@
 package com.example.bosondiag
 
-/** Percentile auto-contrast: 16-bit Y16 samples -> 8-bit gray ARGB, with smoothed range. */
+/**
+ * Y16 -> palette-colored ARGB.
+ * Optional per-pixel offset (software fixed-pattern correction) is subtracted first, then a
+ * smoothed 1%-99% percentile stretch is applied (never narrower than [minRange] counts).
+ */
 class ToneMapper(private val w: Int, private val h: Int) {
     private val total = w * h
     private val vals = IntArray(total)
@@ -13,12 +17,16 @@ class ToneMapper(private val w: Int, private val h: Int) {
         haveRange = false
     }
 
-    fun map(f: ByteArray, invert: Boolean, out: IntArray) {
+    fun map(f: ByteArray, lut: IntArray, offset: IntArray?, minRange: Float, out: IntArray) {
         java.util.Arrays.fill(hist, 0)
         var j = 0
         for (p in 0 until total) {
-            val v = (f[j].toInt() and 0xFF) or ((f[j + 1].toInt() and 0xFF) shl 8)
+            var v = (f[j].toInt() and 0xFF) or ((f[j + 1].toInt() and 0xFF) shl 8)
             j += 2
+            if (offset != null) {
+                v -= offset[p]
+                if (v < 0) v = 0 else if (v > 65535) v = 65535
+            }
             vals[p] = v
             hist[v shr 2]++
         }
@@ -49,14 +57,17 @@ class ToneMapper(private val w: Int, private val h: Int) {
             lo += (loV - lo) * 0.1f
             hi += (hiV - hi) * 0.1f
         }
-        val range = maxOf(hi - lo, 64f)
+        var base = lo
+        var range = hi - lo
+        if (range < minRange) {
+            base = (lo + hi) / 2f - minRange / 2f
+            range = minRange
+        }
         val scale = 255f / range
-        val l = lo
         for (p in 0 until total) {
-            var g = ((vals[p] - l) * scale).toInt()
+            var g = ((vals[p] - base) * scale).toInt()
             if (g < 0) g = 0 else if (g > 255) g = 255
-            if (invert) g = 255 - g
-            out[p] = (0xFF shl 24) or (g shl 16) or (g shl 8) or g
+            out[p] = lut[g]
         }
     }
 }
