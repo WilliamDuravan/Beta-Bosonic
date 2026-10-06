@@ -61,7 +61,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     @Volatile private var fpnOffset: IntArray? = null
     @Volatile private var calSum: IntArray? = null
     @Volatile private var calRemaining = 0
-    private val minRangeChoices = floatArrayOf(64f, 150f, 300f, 600f)
+    private val minRangeChoices = listOf(64f, 150f, 300f, 600f)
 
     private val surfaceLock = Any()
     private var surfaceReady = false
