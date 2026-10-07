@@ -38,7 +38,7 @@ class UvcBulkStreamer(
     private val frameIndex: Int,
     private val frameInterval100ns: Int,
     private val frameBytes: Int,
-    private val onFrame: (ByteArray) -> Unit,
+    private val onFrame: (ByteArray, Long, Long) -> Unit,
     private val onLog: (String) -> Unit
 ) : Thread("UvcBulkStreamer") {
 
@@ -159,6 +159,7 @@ class UvcBulkStreamer(
         var payloadValid = false
         var eofPending = false
         var frameErr = false
+        var curPts = -1L
         var consecutiveErr = 0
         var loggedHeaders = 0
 
@@ -220,6 +221,7 @@ class UvcBulkStreamer(
                         frameErr = false
                     }
                     lastFid = fid
+                    curPts = if ((info and 0x04) != 0 && hl >= 6) buf.u32(2) else -1L
                     if ((info and 0x40) != 0) frameErr = true
                     if ((info and 0x02) != 0) eofPending = true
                 }
@@ -232,7 +234,7 @@ class UvcBulkStreamer(
                 if (fill == frameBytes) {
                     if (!frameErr) {
                         framesOk++
-                        onFrame(frame)
+                        onFrame(frame, framesOk, curPts)
                     } else {
                         framesBad++
                     }

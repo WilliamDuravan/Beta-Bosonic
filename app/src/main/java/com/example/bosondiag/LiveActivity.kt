@@ -19,6 +19,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
@@ -50,6 +51,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var palBtn: Button
     private lateinit var minBtn: Button
     private lateinit var fpnBtn: Button
+    private lateinit var rawBtn: Button
     private lateinit var recBtn: Button
 
     private var streamer: UvcBulkStreamer? = null
@@ -62,6 +64,16 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     @Volatile private var calSum: IntArray? = null
     @Volatile private var calRemaining = 0
     private val minRangeChoices = listOf(64f, 150f, 300f, 600f)
+
+    // Tone curve.
+    @Volatile private var curveEnabled = false
+    private var curveT = ToneCurve.DEF_T
+    private var curveM = ToneCurve.DEF_M
+    private var curveS = ToneCurve.DEF_S
+    @Volatile private var curveLut: IntArray? = null
+    private lateinit var toneView: ToneCurveView
+    private lateinit var curveBtn: Button
+    private val toneHist = IntArray(ToneMapper.HBINS)
 
     private val surfaceLock = Any()
     private var surfaceReady = false
@@ -79,7 +91,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     @Volatile private var pendingSnap = false
     private val bmp: Bitmap = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
     private val pixels = IntArray(W * H)
-    private val mapper = ToneMapper(W, H)
+    private val mapper = ToneMapper(W, H, true)
     private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
 
     // Recording.
@@ -92,6 +104,10 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     // Serial.
     private val serialExec = Executors.newSingleThreadExecutor()
     private var serial: BosonSerial? = null
+
+    // Raw recording.
+    @Volatile private var rawRec: RawRecorder? = null
+    private var rawStartMs = 0L
 
     private val logLines = ArrayList<String>()
     private val ui = Handler(Looper.getMainLooper())
@@ -109,11 +125,31 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    private val toneTicker = object : Runnable {
+        override fun run() {
+            if (curveEnabled) {
+                mapper.copyHistogram(toneHist)
+                toneView.setData(toneHist, mapper.rangeBase, mapper.rangeSpan)
+            }
+            ui.postDelayed(this, 150)
+        }
+    }
+
     private val ticker = object : Runnable {
         override fun run() {
+            val rr = rawRec
+            if (rr != null && (rr.lowSpace || rr.writeError != null)) {
+                log(
+                    if (rr.lowSpace) "raw recording stopped: storage nearly full"
+                    else "raw recording stopped: write error ${rr.writeError}"
+                )
+                stopRawRecording()
+                updateButtons()
+            }
             val s = streamer
             if (s != null && !s.isAlive) {
                 streamer = null
+                stopRawRecording()
                 stopRecording()
                 stopRender()
                 updateButtons()
@@ -132,6 +168,8 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         usb = getSystemService(Context.USB_SERVICE) as UsbManager
+        loadTone()
+        rebuildCurve()
         buildUi()
     }
 
@@ -144,11 +182,13 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         )
         startStream()
         ui.post(ticker)
+        ui.post(toneTicker)
     }
 
     override fun onStop() {
         super.onStop()
         ui.removeCallbacks(ticker)
+        ui.removeCallbacks(toneTicker)
         stopStream()
         closeSerial()
         unregisterReceiver(detachReceiver)
@@ -194,6 +234,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         }
         palBtn = btn("White-hot") {
             paletteIdx = (paletteIdx + 1) % Palettes.names.size
+            saveTone()
             updateButtons()
         }
         val snapBtn = btn("Snap") {
@@ -221,6 +262,30 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         }
         val consoleBtn = btn("Console") { showConsole() }
 
+        rawBtn = btn("Raw rec") {
+            if (rawRec == null) startRawRecording() else stopRawRecording()
+            updateButtons()
+        }
+        toneView = ToneCurveView(act)
+        toneView.t = curveT
+        toneView.m = curveM
+        toneView.s = curveS
+        toneView.visibility = if (curveEnabled) View.VISIBLE else View.GONE
+        toneView.onChange = {
+            curveT = toneView.t
+            curveM = toneView.m
+            curveS = toneView.s
+            rebuildCurve()
+            saveTone()
+        }
+        curveBtn = btn("Curve: off") {
+            curveEnabled = !curveEnabled
+            rebuildCurve()
+            toneView.visibility = if (curveEnabled) View.VISIBLE else View.GONE
+            saveTone()
+            updateButtons()
+        }
+        val resetCurveBtn = btn("Reset curve") { toneView.resetHandles() }
         val calBtn = btn("Cal FPN") { startCalibration() }
         fpnBtn = btn("FPN: none") {
             if (fpnOffset == null) {
@@ -233,6 +298,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         minBtn = btn("Min range: 64") {
             val i = minRangeChoices.indexOf(minRange)
             minRange = minRangeChoices[(i + 1) % minRangeChoices.size]
+            saveTone()
             updateButtons()
         }
 
@@ -252,13 +318,19 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         root.orientation = LinearLayout.VERTICAL
         root.addView(surface, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         root.addView(statsView)
+        root.addView(toneView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(104)))
         root.addView(row1)
         root.addView(row2)
         val row3 = LinearLayout(act)
         row3.addView(calBtn)
         row3.addView(fpnBtn)
         row3.addView(minBtn)
+        row3.addView(rawBtn)
         root.addView(row3)
+        val row4 = LinearLayout(act)
+        row4.addView(curveBtn)
+        row4.addView(resetCurveBtn)
+        root.addView(row4)
         setContentView(root)
 
         ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
@@ -276,6 +348,8 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         fpsBtn.text = if (fps60) "Rate: 60" else "Rate: 30"
         palBtn.text = Palettes.names[paletteIdx]
         minBtn.text = "Min range: " + minRange.toInt()
+        rawBtn.text = if (rawRec == null) "Raw rec" else "Stop raw"
+        curveBtn.text = if (curveEnabled) "Curve: on" else "Curve: off"
         fpnBtn.text = "FPN: " + (if (fpnOffset == null) "none" else if (fpnEnabled) "on" else "off")
         recBtn.text = if (recThread == null) "Rec" else "Stop rec"
     }
@@ -323,7 +397,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
             2, 1,
             if (fps60) 166666 else 333333,
             W * H * 2,
-            { offerFrame(it) },
+            { f, n, pts -> offerFrame(f, n, pts) },
             { log(it) }
         )
         streamer = s
@@ -333,6 +407,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun stopStream() {
+        stopRawRecording()
         stopRecording()
         val s = streamer
         if (s != null) {
@@ -344,7 +419,9 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
     }
 
     // USB thread: copy only.
-    private fun offerFrame(f: ByteArray) {
+    private fun offerFrame(f: ByteArray, usbFrame: Long, pts: Long) {
+        val rr = rawRec
+        if (rr != null) rr.offer(f, usbFrame, SystemClock.elapsedRealtimeNanos() / 1000, pts)
         val sum = calSum
         if (sum != null && calRemaining > 0) {
             var j = 0
@@ -392,7 +469,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
                 val s = awaitFrame(lastSeq, local) { renderRunning }
                 if (s < 0) continue
                 lastSeq = s
-                mapper.map(local, Palettes.luts[paletteIdx], if (fpnEnabled) fpnOffset else null, minRange, pixels)
+                mapper.map(local, Palettes.luts[paletteIdx], if (fpnEnabled) fpnOffset else null, minRange, curveLut, pixels)
                 bmp.setPixels(pixels, 0, W, 0, 0, W, H)
                 drawBitmap()
                 renderedFrames++
@@ -485,7 +562,7 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
                     val s = awaitFrame(lastSeq, local) { recRunning }
                     if (s < 0) continue
                     lastSeq = s
-                    recMapper.map(local, Palettes.luts[paletteIdx], if (fpnEnabled) fpnOffset else null, minRange, px)
+                    recMapper.map(local, Palettes.luts[paletteIdx], if (fpnEnabled) fpnOffset else null, minRange, curveLut, px)
                     rb.setPixels(px, 0, W, 0, 0, W, H)
                     rec.addFrame(rb)
                     recFrames++
@@ -512,6 +589,78 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
         frameLock.withLock { frameCond.signalAll() }
         try { t.join(8000) } catch (_: InterruptedException) {}
         recThread = null
+    }
+
+    // ---------------------------------------------------------------- tone settings
+
+    private fun rebuildCurve() {
+        curveLut = if (curveEnabled) ToneCurve.buildLut(curveT, curveM, curveS) else null
+    }
+
+    private fun loadTone() {
+        val p = getSharedPreferences("tone", Context.MODE_PRIVATE)
+        paletteIdx = p.getInt("palette", 0).coerceIn(0, Palettes.names.size - 1)
+        minRange = p.getFloat("minRange", 64f)
+        curveEnabled = p.getBoolean("curveOn", false)
+        curveT = p.getFloat("curveT", ToneCurve.DEF_T)
+        curveM = p.getFloat("curveM", ToneCurve.DEF_M)
+        curveS = p.getFloat("curveS", ToneCurve.DEF_S)
+        if (!(curveT >= ToneCurve.T_MIN && curveT + ToneCurve.GAP <= curveM &&
+                curveM + ToneCurve.GAP <= curveS && curveS <= ToneCurve.S_MAX)
+        ) {
+            curveT = ToneCurve.DEF_T
+            curveM = ToneCurve.DEF_M
+            curveS = ToneCurve.DEF_S
+        }
+    }
+
+    private fun saveTone() {
+        getSharedPreferences("tone", Context.MODE_PRIVATE).edit()
+            .putInt("palette", paletteIdx)
+            .putFloat("minRange", minRange)
+            .putBoolean("curveOn", curveEnabled)
+            .putFloat("curveT", curveT)
+            .putFloat("curveM", curveM)
+            .putFloat("curveS", curveS)
+            .apply()
+    }
+
+    // ---------------------------------------------------------------- raw recording
+
+    private fun startRawRecording() {
+        if (rawRec != null) return
+        val dev = findDevice()
+        if (streamer == null || dev == null) {
+            Toast.makeText(this, "Start streaming first", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val serialNo: String? = try { dev.serialNumber } catch (_: Exception) { null }
+        val r = RawRecorder(applicationContext, W, H, if (fps60) 60 else 30, serialNo, filesDir)
+        try {
+            r.start()
+        } catch (e: Exception) {
+            log("raw start failed: $e")
+            r.abort()
+            return
+        }
+        rawStartMs = SystemClock.elapsedRealtime()
+        rawRec = r
+        log("raw recording -> Download/BosonThermal/${r.rawName} (+ .csv)")
+    }
+
+    private fun stopRawRecording() {
+        val r = rawRec ?: return
+        rawRec = null
+        Thread {
+            val kept = r.finish()
+            log(
+                if (kept) String.format(
+                    Locale.US, "raw saved: %s, %d frames, %.0f MB, %d dropped in app",
+                    r.rawName, r.framesWritten, r.bytesWritten / 1e6, r.framesDropped
+                ) else "raw recording discarded (no frames)"
+            )
+            runOnUiThread { updateButtons() }
+        }.start()
     }
 
     // ---------------------------------------------------------------- FPN calibration
@@ -682,6 +831,20 @@ class LiveActivity : Activity(), SurfaceHolder.Callback {
                 String.format(
                     Locale.US, "REC %02d:%02d  fed=%d  encoded=%d  %.1f MB",
                     secs / 60, secs % 60, recFrames, rec.framesWritten, rec.bytesWritten / 1e6
+                )
+            )
+        }
+        val rr = rawRec
+        if (rr != null) {
+            val secs = (SystemClock.elapsedRealtime() - rawStartMs) / 1000
+            val bytesPerSec = W * H * 2.0 * (if (fps60) 60 else 30)
+            val freeBytes = filesDir.usableSpace.toDouble()
+            sb.appendLine(
+                String.format(
+                    Locale.US,
+                    "RAW %02d:%02d  written=%d (%.0f MB)  dropped=%d  queued=%d  free %.1f GB (~%.0f min)",
+                    secs / 60, secs % 60, rr.framesWritten, rr.bytesWritten / 1e6,
+                    rr.framesDropped, rr.queued(), freeBytes / 1e9, freeBytes / bytesPerSec / 60.0
                 )
             )
         }
